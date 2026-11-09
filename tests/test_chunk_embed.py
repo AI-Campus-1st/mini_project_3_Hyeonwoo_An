@@ -1,0 +1,206 @@
+import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding
+
+from common.docstore import open_db, replace_processed_documents, upsert_documents
+from common.schema import CHUNK_METADATA_FIELDS, CollectMethod, DocType, DocumentRecord, ProcessedRecord
+from indexer.chunk import ChunkConfig, ChunkSource, chunk_document, get_chunk_config
+from indexer.embed import build_collection, verify_collection
+
+SENTENCES = "서울시는 골목상권 지원을 확대한다. 대상은 영세 소상공인이다. 신청은 다음 달부터 받는다. "
+
+
+def _source(text=SENTENCES * 12, published_at="2026-01-08T09:00:00", scope="seoul"):
+    return ChunkSource(doc_id="news_1", doc_type=DocType.NEWS, title="서울시 골목상권 지원 확대", text=text,
+                       source="연합뉴스", url="https://x/1", published_at=published_at, collected_at="2026-10-16",
+                       scope=scope)
+
+
+def test_chunks_carry_title_metadata_and_sentence_boundaries():
+    chunks = chunk_document(_source(), get_chunk_config("c500"))
+    assert len(chunks) == 2
+    assert [c.chunk_id for c in chunks] == ["news_1#000", "news_1#001"]
+    assert all(c.text.startswith("서울시 골목상권 지원 확대\n\n") for c in chunks)
+    assert all(len(c.body) <= 500 for c in chunks)
+    assert chunks[0].body.endswith("다.")                       # 문장 끝에서 자른다
+    meta = chunks[0].metadata
+    assert set(meta) == set(CHUNK_METADATA_FIELDS)
+    assert meta["published_ymd"] == 20260108 and meta["source_tier"] == "언론 보도" and meta["scope"] == "seoul"
+    assert all(v is not None for v in meta.values())
+
+
+def test_no_title_config_and_missing_values():
+    chunks = chunk_document(_source(published_at=None, scope=None), get_chunk_config("c500-notitle"))
+    assert not chunks[0].text.startswith("서울시 골목상권 지원 확대")
+    assert chunks[0].metadata["published_at"] == "" and chunks[0].metadata["published_ymd"] == 0
+    assert chunks[0].metadata["scope"] == ""
+    assert chunk_document(_source(text="   "), get_chunk_config("c500")) == []
+
+
+def test_chunk_config_validation():
+    with pytest.raises(ValueError):
+        ChunkConfig(name="x", chunk_size=100, chunk_overlap=100)
+    with pytest.raises(SystemExit):
+        get_chunk_config("does-not-exist")
+
+
+def _seed(db, docs):
+    with open_db(db) as conn:
+        upsert_documents(conn, [
+            DocumentRecord(doc_id=d, doc_type=DocType.NEWS, source="연합뉴스", title=f"{d} 소상공인 기사",
+                           url=f"https://x/{d}", collected_at="2026-10-16", collect_method=CollectMethod.PROVIDED,
+                           published_at="2026-01-08T09:00:00")
+            for d in docs
+        ])
+        replace_processed_documents(conn, [
+            ProcessedRecord(doc_id=d, status="kept", processed_at="2026-11-03", clean_text=SENTENCES * n,
+                            canonical_doc_id=d, scope="national")
+            for d, n in docs.items()
+        ])
+
+
+@pytest.fixture
+def env(tmp_path):
+    db, chroma = tmp_path / "docs.db", tmp_path / "chroma"
+    _seed(db, {"a": 12, "b": 3})
+    kwargs = dict(embeddings=DeterministicFakeEmbedding(size=16), embedding_model_name="fake",
+                  chroma_dir=chroma, db_path=db, progress=lambda _: None)
+    return db, chroma, kwargs
+
+
+def test_dry_run_reports_without_writing(env):
+    db, chroma, kwargs = env
+    stats = build_collection(get_chunk_config("c500"), "docs__c500", dry_run=True, **kwargs)
+    assert (stats.documents, stats.chunks, stats.added) == (2, 3, 0)
+    assert not chroma.exists()
+    assert "청크 3개" in stats.summary()
+
+
+def test_build_resumes_removes_stale_and_verifies(env):
+    db, chroma, kwargs = env
+    config = get_chunk_config("c500")
+    first = build_collection(config, "docs__c500", **kwargs)
+    assert (first.added, first.already_present) == (3, 0)
+
+    again = build_collection(config, "docs__c500", **kwargs)    # 이어서 적재: 이미 있는 청크는 건너뜀
+    assert (again.added, again.already_present) == (0, 3)
+
+    _seed(db, {"a": 12})                                        # 지식베이스에서 b 가 빠짐
+    shrunk = build_collection(config, "docs__c500", **kwargs)
+    assert shrunk.removed_stale == 1
+
+    report = verify_collection("docs__c500", queries=["골목상권 지원"], embeddings=kwargs["embeddings"],
+                               chroma_dir=chroma, db_path=db)
+    assert (report.chunks, report.documents, report.missing_documents, report.empty_chunks) == (2, 1, 0, 0)
+    assert report.missing_metadata == {name: 0 for name in
+                                       ("doc_type", "source", "title", "url", "published_at", "collected_at")}
+    assert "메타데이터 빈 값 (문서 수): doc_type 0" in report.summary()
+    assert report.metadata["embedding_model"] == "fake" and report.metadata["chunk_config"] == "c500"
+    assert len(report.samples[0][1]) == 2
+
+
+def test_embedding_model_mismatch_requires_rebuild(env):
+    db, chroma, kwargs = env
+    build_collection(get_chunk_config("c500"), "docs__c500", **kwargs)
+    with pytest.raises(SystemExit):
+        build_collection(get_chunk_config("c500"), "docs__c500", **{**kwargs, "embedding_model_name": "other"})
+    rebuilt = build_collection(get_chunk_config("c500"), "docs__c500", rebuild=True,
+                               **{**kwargs, "embedding_model_name": "other"})
+    assert rebuilt.added == 3
+
+
+def test_verify_missing_collection(env):
+    db, chroma, kwargs = env
+    with pytest.raises(SystemExit):
+        verify_collection("docs__none", queries=(), chroma_dir=chroma, db_path=db)
+
+
+def test_short_tail_is_merged_without_duplicating_overlap():
+    from indexer.chunk import _merge_short_tail
+    head = "가" * 900 + " 공통 겹침 문장."
+    assert _merge_short_tail([head, "공통 겹침 문장. 홍길동 기자."]) == [head + " 홍길동 기자."]
+    assert _merge_short_tail([head, "홍길동 기자."]) == [head + " 홍길동 기자."]
+    assert _merge_short_tail([head, "겹침 문장."]) == [head]                 # 이미 앞 청크에 들어 있음
+    long_tail = "나" * 150
+    assert _merge_short_tail([head, long_tail]) == [head, long_tail]        # 충분히 길면 그대로
+    assert _merge_short_tail(["짧은 단일 청크"]) == ["짧은 단일 청크"]
+
+
+def test_chunk_document_has_no_short_tail():
+    text = ("소상공인 지원 문장입니다. " * 70) + "\n\n홍길동 기자."   # 분할하면 [989, 209, 7] 자
+    chunks = chunk_document(_source(text=text), get_chunk_config("c1000"))
+    assert len(chunks) == 2
+    assert all(len(c.body) >= 100 for c in chunks)
+    assert chunks[-1].body.endswith("홍길동 기자.")
+
+
+def test_rebuild_after_chunk_text_change_updates_only_changed(env):
+    db, chroma, kwargs = env
+    build_collection(get_chunk_config("c500"), "docs__c500", **kwargs)
+    # 같은 청크 id 의 내용이 바뀌는 경우 (청킹 규칙 변경 등): 제목 포함 → 제외 설정으로 같은 컬렉션에 다시 적재
+    stats = build_collection(get_chunk_config("c500-notitle"), "docs__c500", **kwargs)
+    assert (stats.added, stats.updated, stats.already_present) == (0, 3, 0)
+    again = build_collection(get_chunk_config("c500-notitle"), "docs__c500", **kwargs)
+    assert (again.added, again.updated, again.already_present) == (0, 0, 3)
+
+
+def test_full_collection_reads_are_paginated(env, monkeypatch):
+    import indexer.embed as embed_module
+    db, chroma, kwargs = env
+    build_collection(get_chunk_config("c500"), "docs__c500", **kwargs)
+    monkeypatch.setattr(embed_module, "GET_PAGE", 2)             # 3개 청크를 2개씩 나눠 읽게 한다
+    report = verify_collection("docs__c500", queries=(), chroma_dir=chroma, db_path=db)
+    assert (report.chunks, report.documents, report.missing_documents) == (3, 2, 0)
+    _seed(db, {"a": 12})
+    assert build_collection(get_chunk_config("c500"), "docs__c500", **kwargs).removed_stale == 1
+
+
+class _NoCallEmbeddings(DeterministicFakeEmbedding):
+    def embed_documents(self, texts):
+        raise AssertionError("메타데이터만 바뀐 청크를 다시 임베딩했습니다")
+
+
+def test_metadata_only_change_updates_without_embedding(env):
+    import chromadb
+    db, chroma, kwargs = env
+    build_collection(get_chunk_config("c500"), "docs__c500", **kwargs)
+    with open_db(db) as conn:                                   # 품질 규칙 변경으로 b 의 scope 만 바뀐 상황
+        conn.execute("UPDATE processed_documents SET scope = 'seoul' WHERE doc_id = 'b'")
+        conn.commit()
+    stats = build_collection(get_chunk_config("c500"), "docs__c500",
+                             **{**kwargs, "embeddings": _NoCallEmbeddings(size=16)})
+    assert (stats.added, stats.updated, stats.metadata_updated, stats.already_present) == (0, 0, 1, 2)
+    col = chromadb.PersistentClient(path=str(chroma)).get_collection("docs__c500")
+    assert col.get(ids=["b#000"], include=["metadatas"])["metadatas"][0]["scope"] == "seoul"
+    assert "메타데이터만 갱신 1개" in stats.summary()
+
+
+def test_dates_dry_run_counts_annotated_expressions(env):
+    db, chroma, kwargs = env
+    stats = build_collection(get_chunk_config("c500-dates"), "docs__c500-dates", dry_run=True, **kwargs)
+    assert (stats.dated_documents, stats.dated_expressions) == (2, 15)      # '다음 달' 이 a 에 12번, b 에 3번
+    assert "표현 15개" in stats.summary()
+
+
+def test_missing_metadata_counts_documents_not_chunks():
+    from indexer.embed import missing_metadata_counts
+    metas = [{"doc_id": "a", "url": "u", "published_at": ""}, {"doc_id": "a", "url": "u", "published_at": ""},
+             {"doc_id": "b", "url": "", "published_at": "2026-01-01"}]
+    counts = missing_metadata_counts(metas)
+    assert counts["published_at"] == 1 and counts["url"] == 1 and counts["title"] == 2
+
+
+def test_count_tokens_uses_encoder_and_tolerates_missing_tokenizer(monkeypatch):
+    from indexer.embed import BuildStats, count_tokens
+
+    class FakeEncoding:
+        def encode_batch(self, texts):
+            return [t.split() for t in texts]
+
+    assert count_tokens(["a b", "c"], encoding=FakeEncoding()) == 3
+    import builtins
+    real_import = builtins.__import__
+    monkeypatch.setattr(builtins, "__import__",
+                        lambda name, *a, **k: (_ for _ in ()).throw(ImportError()) if name == "tiktoken"
+                        else real_import(name, *a, **k))
+    assert count_tokens(["a"]) is None
+    assert "임베딩 입력 토큰: 1,234개" in BuildStats(collection="c", embedding_tokens=1234).summary()

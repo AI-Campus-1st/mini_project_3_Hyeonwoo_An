@@ -1,0 +1,37 @@
+# --- Secrets (가이드 4-1: API 키는 저장소에 포함하지 않는다) ---
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- 데이터 (제공 데이터·크롤링 원본은 용량·재배포 문제로 커밋하지 않는다) ---
+data/provided/*
+data/raw/*
+!data/provided/.gitkeep
+!data/raw/.gitkeep
+# 평가셋 작성용 검색 결과와 문항 초안 (기사 본문 일부 포함)
+data/*.md
+data/*.txt
+# 제공 CSV 는 어느 위치에 두어도 커밋되지 않게 한다 (GitHub 파일당 100MB 제한, 재배포 금지 문구 포함)
+*_묶음_*건_*.csv
+*_키워드_*건_*.csv
+_집계결과_summary.csv
+_README_조회방식.md
+
+# --- ③ 저장 계층 (인덱서 실행으로 재생성되는 산출물) ---
+store/*
+!store/.gitkeep
+
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
